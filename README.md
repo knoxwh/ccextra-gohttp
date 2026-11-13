@@ -10,7 +10,9 @@ The ClientHello comes from the Go toolchain: after a rebuild or Go upgrade, run
 
 Run: `./ccextra-gohttp -socket /path/to/private/dir/gohttp.sock`
 (dir created 0700, socket 0600, removed on SIGINT/SIGTERM; no TCP listener; exits if
-the socket is already served by another instance)
+the socket is already served by another instance). With `-exit-on-stdin-eof` it also
+exits (removing the socket) once stdin reaches EOF: ccextra passes it and keeps the pipe's
+write end, so the sidecar follows its parent even after kill -9. Off by default.
 
 Protocol: send an absolute-form request line, e.g. `POST https://host/path HTTP/1.1`, with
 the real headers/body; status, headers and body (streamed, SSE ok) come back as-is.

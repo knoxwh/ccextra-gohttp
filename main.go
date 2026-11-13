@@ -42,6 +42,7 @@ const maxBodyBytes = 32 << 20
 
 func main() {
 	sock := flag.String("socket", "", "Unix socket path (required)")
+	exitOnStdinEOF := flag.Bool("exit-on-stdin-eof", false, "exit when stdin hits EOF (parent holds the write end)")
 	flag.Parse()
 	if *sock == "" {
 		log.Fatal("-socket is required")
@@ -70,7 +71,14 @@ func main() {
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	go func() { <-sig; ln.Close(); os.Remove(*sock); os.Exit(0) }()
+	// No ln.Close: Serve would return and race log.Fatal (exit 1) against Exit(0).
+	shutdown := func() { os.Remove(*sock); os.Exit(0) }
+	go func() { <-sig; shutdown() }()
+	if *exitOnStdinEOF {
+		// The parent keeps the pipe's write end; EOF means it is gone, even after
+		// SIGKILL or a panic=abort crash where it could not send SIGTERM.
+		go func() { io.Copy(io.Discard, os.Stdin); shutdown() }()
+	}
 
 	srv := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

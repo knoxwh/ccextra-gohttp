@@ -12,11 +12,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -735,5 +737,85 @@ func handleRefusedPostH2Conn(c net.Conn) {
 			c.Write([]byte{0, 0, 4, 3, 0, 0, 0, 0, 3, 0, 0, 0, 7})             // RST_STREAM REFUSED_STREAM
 			c.Write([]byte{0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0}) // GOAWAY LastStreamID=1
 		}
+	}
+}
+
+// TestMain lets subprocess tests re-exec this binary as the real sidecar:
+// GOHTTP_RUN_MAIN=1 runs main() with the space-separated flags in GOHTTP_ARGS.
+func TestMain(m *testing.M) {
+	if os.Getenv("GOHTTP_RUN_MAIN") == "1" {
+		os.Args = append([]string{"ccextra-gohttp"}, strings.Fields(os.Getenv("GOHTTP_ARGS"))...)
+		main()
+		return
+	}
+	os.Exit(m.Run())
+}
+
+func TestExitOnStdinEOF(t *testing.T) {
+	for _, on := range []bool{true, false} {
+		t.Run(fmt.Sprint("flag=", on), func(t *testing.T) {
+			dir, err := os.MkdirTemp("/tmp", "gohttp") // short path: macOS socket length limit
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { os.RemoveAll(dir) })
+			sock := filepath.Join(dir, "s.sock")
+			args := "-socket " + sock
+			if on {
+				args += " -exit-on-stdin-eof"
+			}
+			cmd := exec.Command(os.Args[0])
+			cmd.Env = append(os.Environ(), "GOHTTP_RUN_MAIN=1", "GOHTTP_ARGS="+args)
+			stdin, err := cmd.StdinPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- cmd.Wait() }()
+			t.Cleanup(func() { cmd.Process.Kill(); <-done })
+			for deadline := time.Now().Add(5 * time.Second); ; {
+				c, err := net.Dial("unix", sock)
+				if err == nil {
+					c.Close()
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("sidecar not listening: %v", err)
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+
+			stdin.Close()
+			if on {
+				select {
+				case err := <-done:
+					done <- err // let Cleanup's receive return
+					if err != nil {
+						t.Fatalf("exit: %v", err)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("still running after stdin EOF")
+				}
+				if _, err := os.Stat(sock); !os.IsNotExist(err) {
+					t.Fatalf("socket not removed: %v", err)
+				}
+				return
+			}
+			select {
+			case err := <-done:
+				done <- err
+				t.Fatalf("exited on stdin EOF without the flag: %v", err)
+			case <-time.After(500 * time.Millisecond):
+			}
+			c, err := net.Dial("unix", sock)
+			if err != nil {
+				t.Fatalf("not serving after stdin EOF: %v", err)
+			}
+			c.Close()
+			cmd.Process.Signal(syscall.SIGTERM)
+		})
 	}
 }
