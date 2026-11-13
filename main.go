@@ -4,8 +4,10 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
 	"flag"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -16,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 // proxyHeader carries the proxy URL already resolved by ccextra (http, https,
@@ -60,6 +63,7 @@ func newTransport() *http.Transport {
 	tr := http.DefaultTransport.(*http.Transport).Clone()     // HTTP/2 stays on (ForceAttemptHTTP2)
 	tr.Proxy = nil                                            // never the environment; set per proxy in transports.get
 	tr.TLSClientConfig = &tls.Config{ClientSessionCache: nil} // no resumption -> no ext 35/41
+	tr.HTTP2 = &http.HTTP2Config{SendPingTimeout: 15 * time.Second, PingTimeout: 5 * time.Second}
 	return tr
 }
 
@@ -132,12 +136,20 @@ func forward(p *transports, w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid "+proxyHeader+" (want http/https/socks5/socks5h URL)", http.StatusBadRequest)
 		return
 	}
-	out, err := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), r.Body)
+	var body io.Reader
+	if r.Body != nil && r.Body != http.NoBody {
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		body = bytes.NewReader(b)
+	}
+	out, err := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	out.ContentLength = r.ContentLength
 	out.Header = r.Header.Clone()
 	out.Header.Del(proxyHeader)
 	for _, h := range hopHeaders {
@@ -156,6 +168,7 @@ func forward(p *transports, w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(resp.StatusCode)
 
 	rc := http.NewResponseController(w)
+	rc.Flush() // forward response headers before waiting for first body chunk
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := resp.Body.Read(buf)
@@ -166,6 +179,9 @@ func forward(p *transports, w http.ResponseWriter, r *http.Request) {
 			rc.Flush() // keep SSE streaming
 		}
 		if err != nil {
+			if err != io.EOF {
+				panic(http.ErrAbortHandler)
+			}
 			return
 		}
 	}
