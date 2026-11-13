@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"compress/gzip"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
@@ -303,6 +304,100 @@ func TestH2ConnsNotSharedAcrossProxies(t *testing.T) {
 	hb, _, _ := b.snapshot()
 	if ha != 1 || hb != 1 { // A reused for its 2nd request; direct never through a proxy
 		t.Fatalf("proxy A hits=%d, B hits=%d; want 1 and 1", ha, hb)
+	}
+}
+
+func TestResponseHopHeadersStripped(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Connection", "X-Upstream-Hop")
+		w.Header().Set("X-Upstream-Hop", "leak")
+		w.Header().Set("Keep-Alive", "timeout=5")
+		w.Header().Set("X-Kept", "1")
+		io.WriteString(w, "ok")
+	}))
+	t.Cleanup(srv.Close)
+	pool := x509.NewCertPool()
+	pool.AddCert(srv.Certificate())
+
+	rec := do(testTransport(pool), srv.URL+"/x", "")
+	if rec.Code != 200 || rec.Body.String() != "ok" {
+		t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+	}
+	for _, h := range []string{"Connection", "Keep-Alive", "X-Upstream-Hop"} {
+		if rec.Header().Get(h) != "" {
+			t.Fatalf("%s relayed downstream", h)
+		}
+	}
+	if rec.Header().Get("X-Kept") != "1" {
+		t.Fatalf("normal response header lost: %v", rec.Header())
+	}
+}
+
+func TestRequestConnectionTokensStripped(t *testing.T) {
+	srv, pool, seen := upstream(t)
+	req := httptest.NewRequest("GET", srv.URL+"/x", nil)
+	req.Header.Set("Connection", "X-Drop-Me")
+	req.Header.Set("X-Drop-Me", "leak")
+	req.Header.Set("X-Test", "1")
+	rec := httptest.NewRecorder()
+	forward(testTransport(pool), rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+	}
+	got := <-seen
+	assertNoProxyHeaders(t, got)
+	if got.Get("X-Drop-Me") != "" {
+		t.Fatalf("Connection-listed header relayed upstream: %v", got)
+	}
+}
+
+func TestBodyTooLarge(t *testing.T) {
+	srv, pool, seen := upstream(t)
+	req := httptest.NewRequest("POST", srv.URL+"/x", io.LimitReader(zeroReader{}, maxBodyBytes+1))
+	rec := httptest.NewRecorder()
+	forward(testTransport(pool), rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("got %d, want 413", rec.Code)
+	}
+	select {
+	case <-seen:
+		t.Fatal("oversized body reached upstream")
+	default:
+	}
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) { return len(p), nil }
+
+// ccextra sends no Accept-Encoding on purpose; net/http must add gzip upstream
+// (matching the official language_server) and hand back decompressed bytes.
+func TestGzipNegotiatedAndDecompressed(t *testing.T) {
+	var enc atomic.Value
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		enc.Store(r.Header.Get("Accept-Encoding"))
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Encoding", "gzip")
+		zw := gzip.NewWriter(w)
+		io.WriteString(zw, "data: 1\n\n")
+		zw.Close()
+	}))
+	t.Cleanup(srv.Close)
+	pool := x509.NewCertPool()
+	pool.AddCert(srv.Certificate())
+
+	rec := do(testTransport(pool), srv.URL+"/x", "")
+	if rec.Code != 200 {
+		t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+	}
+	if got, _ := enc.Load().(string); got != "gzip" {
+		t.Fatalf("upstream Accept-Encoding = %q, want gzip", got)
+	}
+	if body := rec.Body.String(); body != "data: 1\n\n" {
+		t.Fatalf("body not decompressed: %q", body)
+	}
+	if rec.Header().Get("Content-Encoding") != "" {
+		t.Fatalf("Content-Encoding leaked for a decompressed body: %v", rec.Header())
 	}
 }
 

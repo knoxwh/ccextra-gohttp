@@ -4,14 +4,23 @@ Tiny sidecar: takes HTTP/1.1 requests on a local Unix socket and sends them to t
 target over HTTPS with Go's standard `net/http` (default Go TLS ClientHello, HTTP/2 on,
 no session cache). Stdlib only.
 
-Build: `CGO_ENABLED=0 go build -o ccextra-gohttp .`
+Build: `CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o ccextra-gohttp .`
+The ClientHello comes from the Go toolchain: after a rebuild or Go upgrade, run
+`./ja4test/run.sh` and check JA4 still matches the target it prints.
 
 Run: `./ccextra-gohttp -socket /path/to/private/dir/gohttp.sock`
-(dir created 0700, socket 0600, removed on SIGINT/SIGTERM; no TCP listener)
+(dir created 0700, socket 0600, removed on SIGINT/SIGTERM; no TCP listener; exits if
+the socket is already served by another instance)
 
 Protocol: send an absolute-form request line, e.g. `POST https://host/path HTTP/1.1`, with
 the real headers/body; status, headers and body (streamed, SSE ok) come back as-is.
-Redirects are not followed.
+Redirects are not followed. Hop-by-hop headers (and any header named in `Connection`) are
+dropped in both directions. Compression is negotiated by net/http as usual: if the caller
+sends no `Accept-Encoding`, `gzip` is advertised upstream and the response is decompressed
+(and `Content-Encoding` removed) before it is relayed, matching the official
+language_server. Request bodies are buffered so they can be replayed on HTTP/2 retries,
+capped at 32 MiB (413 beyond that).
+Request headers must arrive within 10s; idle client connections close after 90s.
 
 Proxy: optional per-request header `X-Ccextra-Proxy: <url>` (`http`, `https`, `socks5`,
 `socks5h`). Missing/empty = direct. Environment proxies (`HTTP(S)_PROXY`, `ALL_PROXY`) are

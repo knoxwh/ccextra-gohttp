@@ -1,6 +1,10 @@
-// ccextra-gohttp: forwards absolute-form HTTP/1.1 requests received on a
-// local Unix socket to their https:// target using Go's default net/http TLS.
-// An optional per-request X-Ccextra-Proxy header selects an outbound proxy.
+// ccextra-gohttp is ccextra's HTTP sidecar.
+//
+// It accepts HTTP/1.1 requests on a local Unix socket, in absolute form
+// ("POST https://host/path HTTP/1.1"), and performs them over HTTPS with Go's
+// stock net/http client and TLS stack. Responses are relayed as they arrive;
+// redirects are not followed. An optional per-request X-Ccextra-Proxy header
+// selects an outbound proxy.
 package main
 
 import (
@@ -26,7 +30,15 @@ import (
 // value is never logged or echoed (it may hold credentials).
 const proxyHeader = "X-Ccextra-Proxy"
 
-var hopHeaders = []string{"Connection", "Keep-Alive", "Proxy-Connection", "Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade"}
+// hopHeaders are connection-scoped and must not be relayed in either direction
+// (RFC 9110 §7.6.1); net/http rebuilds Transfer-Encoding framing on each side.
+var hopHeaders = []string{"Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "Proxy-Connection", "Te", "Trailer", "Transfer-Encoding", "Upgrade"}
+
+// maxBodyBytes caps buffered request bodies. Bodies are read fully so that
+// http.NewRequest can set GetBody and the HTTP/2 layer can replay the request
+// on a REFUSED_STREAM; streams that exceed the cap are rejected rather than
+// spooled to disk.
+const maxBodyBytes = 32 << 20
 
 func main() {
 	sock := flag.String("socket", "", "Unix socket path (required)")
@@ -38,6 +50,12 @@ func main() {
 	syscall.Umask(0o077) // new dir -> 0700, socket -> 0600
 	if err := os.MkdirAll(filepath.Dir(*sock), 0o700); err != nil {
 		log.Fatal(err)
+	}
+	// A stale socket file is fine to replace; a live one means another sidecar
+	// owns it, and silently unlinking it would split traffic between instances.
+	if c, err := net.Dial("unix", *sock); err == nil {
+		c.Close()
+		log.Fatalf("socket %s already in use", *sock)
 	}
 	os.Remove(*sock)
 	ln, err := net.Listen("unix", *sock)
@@ -54,15 +72,26 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() { <-sig; ln.Close(); os.Remove(*sock); os.Exit(0) }()
 
-	log.Fatal(http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		forward(tr, w, r)
-	})))
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			forward(tr, w, r)
+		}),
+		// Slow-client guard only. ReadTimeout/WriteTimeout stay 0: request bodies
+		// and response streams (SSE) may legitimately live for a long time.
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       90 * time.Second,
+	}
+	log.Fatal(srv.Serve(ln))
 }
 
 func newTransport() *http.Transport {
-	tr := http.DefaultTransport.(*http.Transport).Clone()     // HTTP/2 stays on (ForceAttemptHTTP2)
-	tr.Proxy = nil                                            // never the environment; set per proxy in transports.get
-	tr.TLSClientConfig = &tls.Config{ClientSessionCache: nil} // no resumption -> no ext 35/41
+	tr := http.DefaultTransport.(*http.Transport).Clone() // HTTP/2 stays on (ForceAttemptHTTP2)
+	tr.Proxy = nil                                        // never the environment; set per proxy in transports.get
+	// No TLS session resumption: keeps the ClientHello stable for JA4 pinning
+	// (no session_ticket / pre_shared_key extensions).
+	tr.TLSClientConfig = &tls.Config{ClientSessionCache: nil}
+	// Keep compression on: ccextra relies on net/http's gzip negotiation
+	// (see TestGzipNegotiatedAndDecompressed).
 	tr.HTTP2 = &http.HTTP2Config{SendPingTimeout: 15 * time.Second, PingTimeout: 5 * time.Second}
 	return tr
 }
@@ -138,12 +167,16 @@ func forward(p *transports, w http.ResponseWriter, r *http.Request) {
 	}
 	var body io.Reader
 	if r.Body != nil && r.Body != http.NoBody {
-		b, err := io.ReadAll(r.Body)
+		b, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		body = bytes.NewReader(b)
+		if len(b) > maxBodyBytes {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		body = bytes.NewReader(b) // replayable: NewRequest sets GetBody for *bytes.Reader
 	}
 	out, err := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), body)
 	if err != nil {
@@ -155,6 +188,7 @@ func forward(p *transports, w http.ResponseWriter, r *http.Request) {
 	for _, h := range hopHeaders {
 		out.Header.Del(h)
 	}
+	dropConnectionTokens(out.Header, r.Header)
 
 	resp, err := p.get(raw, proxy).RoundTrip(out) // no redirect following: status passed through as-is
 	if err != nil {
@@ -165,6 +199,10 @@ func forward(p *transports, w http.ResponseWriter, r *http.Request) {
 	for k, v := range resp.Header {
 		w.Header()[k] = v
 	}
+	for _, h := range hopHeaders {
+		w.Header().Del(h) // upstream's framing/connection headers must not be replayed
+	}
+	dropConnectionTokens(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 
 	rc := http.NewResponseController(w)
@@ -183,6 +221,18 @@ func forward(p *transports, w http.ResponseWriter, r *http.Request) {
 				panic(http.ErrAbortHandler)
 			}
 			return
+		}
+	}
+}
+
+// dropConnectionTokens deletes from dst the extra per-hop header names that
+// src's Connection header lists.
+func dropConnectionTokens(dst, src http.Header) {
+	for _, v := range src.Values("Connection") {
+		for _, name := range strings.Split(v, ",") {
+			if name = strings.TrimSpace(name); name != "" {
+				dst.Del(name)
+			}
 		}
 	}
 }
