@@ -9,7 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"sort"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -116,14 +116,14 @@ func fingerprint(hs []byte) (ja3, ja4, ja4r string) {
 	}
 	pre := fmt.Sprintf("t%s%s%02d%02d%s", v, d, len(c), len(e), a)
 	cs := append([]uint16(nil), c...)
-	sort.Slice(cs, func(i, j int) bool { return cs[i] < cs[j] })
+	slices.Sort(cs)
 	var es []uint16
 	for _, x := range e {
 		if x != 0 && x != 16 {
 			es = append(es, x)
 		}
 	}
-	sort.Slice(es, func(i, j int) bool { return es[i] < es[j] })
+	slices.Sort(es)
 	css, ess, sss := joinU16(cs, ",", "%04x"), joinU16(es, ",", "%04x"), joinU16(noGrease(sig), ",", "%04x")
 	h12 := func(s string) string { x := sha256.Sum256([]byte(s)); return hex.EncodeToString(x[:])[:12] }
 	partC := ess

@@ -13,6 +13,7 @@ import (
 	"flag"
 	"io"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -204,9 +205,7 @@ func forward(p *transports, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
-	for k, v := range resp.Header {
-		w.Header()[k] = v
-	}
+	maps.Copy(w.Header(), resp.Header)
 	for _, h := range hopHeaders {
 		w.Header().Del(h) // upstream's framing/connection headers must not be replayed
 	}
@@ -237,7 +236,7 @@ func forward(p *transports, w http.ResponseWriter, r *http.Request) {
 // src's Connection header lists.
 func dropConnectionTokens(dst, src http.Header) {
 	for _, v := range src.Values("Connection") {
-		for _, name := range strings.Split(v, ",") {
+		for name := range strings.SplitSeq(v, ",") {
 			if name = strings.TrimSpace(name); name != "" {
 				dst.Del(name)
 			}
